@@ -356,6 +356,70 @@ class TfaTestCase extends DrupalWebTestCase {
     $this->assertIdentical($plain_text, $tfa_totp->readFromStore());
   }
 
+  public function testLoginLinks() {
+    variable_set('tfa_enabled', TRUE);
+
+    $user = $this->web_user;
+
+    // Create a login link.
+    $link = tfa_onetime_link($user, 'login', array('absolute' => TRUE));
+    // Set the last link creation to 3 days before.
+    variable_set('tfa_latest_login_link', REQUEST_TIME - 3*3600*24);
+
+    // Can't log in with it.
+    $this->drupalGet($link);
+    $this->assertText('Access denied', 'Could not log in.');
+
+    // Set the last link creation to current timestamp.
+    variable_set('tfa_latest_login_link', REQUEST_TIME);
+
+    // Access the link again and successfully log in.
+    $this->drupalGet($link);
+    $this->assertNoText('Access denied', 'Successfully logged in.');
+
+    // Confirm it's the same user.
+    $this->drupalGet('user');
+    $this->assertText($user->name, 'Logged in correctly.');
+
+    // Log out.
+    $this->drupalGet('user/logout');
+
+    // Try to log in again with the same link.
+    $this->drupalGet($link);
+    $this->assertText('Access denied', 'Could not log in twice.');
+
+    // Log out.
+    $this->drupalGet('user/logout');
+
+    // Refresh $user.
+    $user = user_load($user->uid);
+
+    // Create a login link with an invalid token.
+    $token = drupal_hash_base64('random_seed');
+    $url = 'system/tfa_bypass/login/' . REQUEST_TIME . '/' . $user->uid . '/' . $token;
+    $link = url($url, array('absolute' => TRUE));
+
+    // Try to log in using the invalid link.
+    $this->drupalGet($link);
+    $this->assertText($this->uiStrings('invalid-link'), 'Could not log in using invalid link.');
+
+    // Create a valid, but expired link.
+    $expire_after = variable_get('tfa_bypass_link_expiration', 3600 * 24);
+    $timestamp = REQUEST_TIME - $expire_after - 30;
+    $token = tfa_onetime_token($user, 'login', $timestamp);
+    $url = 'system/tfa_bypass/login/' . $timestamp . '/' . $user->uid . '/' . $token;
+    $link = url($url, array('absolute' => TRUE));
+
+    // Try to log in using the expired link.
+    $this->drupalGet($link);
+    $this->assertText($this->uiStrings('expired-link'), 'Could not log in using expired link.');
+
+    // Already failed to log in 3 times. Set the flood threshold to 4 and try again.
+    variable_set('tfa_bypass_threshold', 4);
+    $this->drupalGet($link);
+    $this->assertText($this->uiStrings('flood-bypass'), 'Could not log in due to flooding.');
+  }
+
   /**
    * TFA module user interface strings.
    *
@@ -370,6 +434,12 @@ class TfaTestCase extends DrupalWebTestCase {
         return 'You have reached the threshold for incorrect code entry attempts.';
       case 'flood-begin':
         return 'You have reached the threshold for TFA attempts.';
+      case 'invalid-link':
+        return 'You have tried to use an invalid one-time link. Please request a new one.';
+      case 'expired-link':
+        return 'You have tried to use an expired one-time link. Please request a new one.';
+      case 'flood-bypass':
+        return 'You have reached the threshold for invalid one-time link access attempts.';
     }
   }
 }

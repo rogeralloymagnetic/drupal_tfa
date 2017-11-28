@@ -19,6 +19,10 @@ function tfa_uninstall() {
   variable_del('tfa_required');
   variable_del('tfa_enabled');
   variable_del('tfa_test_mode');
+  variable_del('tfa_bypass_link_expiration');
+  variable_del('tfa_latest_login_link');
+  variable_del('tfa_bypass_threshold');
+  variable_del('tfa_bypass_window');
 }
 
 /**

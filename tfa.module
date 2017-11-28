@@ -26,6 +26,15 @@ function tfa_menu() {
     'access arguments' => array('admin tfa settings'),
     'file' => 'tfa.admin.inc',
   );
+
+  $items['system/tfa_bypass/login/%/%user/%'] = array(
+    'title' => 'TFA login link',
+    'page callback' => 'tfa_bypass_login',
+    'page arguments' => array(4),
+    'access callback' => 'tfa_bypass_access',
+    'access arguments' => array(2, 3, 4, 5, 'tfa_bypass_login_access'),
+    'type' => MENU_CALLBACK,
+  );
   return $items;
 }
 
@@ -50,6 +59,124 @@ function tfa_permission() {
       'restrict access' => TRUE,
     ),
   );
+}
+
+/**
+ * Creates a one-time token for a user account.
+ *
+ * This token is valid until the user logs in, and is unique to the site.
+ *
+ * @param object $account
+ * @param string $type
+ * @param int $timestamp
+ *
+ * @return string
+ */
+function tfa_onetime_token($account, $type, $timestamp) {
+  $data = implode(':', array(
+    drupal_get_hash_salt(),
+    $timestamp,
+    $account->name,
+    $account->pass,
+    $account->login,
+    $type,
+  ));
+  return drupal_hash_base64($data);
+}
+
+/**
+ * Creates a one-time link for a user account.
+ *
+ * @param object $account
+ * @param string $type
+ * @param array $options
+ *
+ * @return string
+ *
+ * @see tfa_onetime_token()
+ */
+function tfa_onetime_link($account, $type, array $options) {
+  $timestamp = REQUEST_TIME;
+  $token = tfa_onetime_token($account, $type, $timestamp);
+  $url = 'system/tfa_bypass/' . $type . '/' . $timestamp . '/' . $account->uid . '/' . $token;
+  return url($url, $options);
+}
+
+/**
+ * Common access control for bypass links.
+ *
+ * @param string $type
+ * @param int $timestamp
+ * @param object $account
+ * @param string $token
+ * @param callable $custom_access
+ *
+ * @return bool
+ */
+function tfa_bypass_access($type, $timestamp, $account, $token, $custom_access = NULL) {
+  // Flood control.
+  if (!variable_get('tfa_test_mode', 0)) {
+    $window = variable_get('tfa_bypass_window', 3600);
+    flood_register_event('tfa_bypass', $window);
+    if (!flood_is_allowed('tfa_bypass', variable_get('tfa_bypass_threshold', 6), $window)) {
+      drupal_set_message(t('You have reached the threshold for invalid one-time link access attempts. Please request a new link and try again in !time minutes.', array('!time' => round($window / 60))), 'error');
+      return FALSE;
+    }
+  }
+
+  // Access control.
+  if (tfa_onetime_token($account, $type, $timestamp) == $token) {
+    $expire_after = variable_get('tfa_bypass_link_expiration', 3600 * 24);
+    if (REQUEST_TIME - $timestamp > $expire_after) {
+      // Link was expired.
+      drupal_set_message(t('You have tried to use an expired one-time link. Please request a new one.'), 'error');
+      return FALSE;
+    }
+    if ($custom_access != NULL) {
+      // Invoke custom access control function.
+      if (call_user_func_array($custom_access, array($account, $timestamp))) {
+        flood_clear_event('tfa_bypass');
+        return TRUE;
+      }
+      else {
+        return FALSE;
+      }
+    }
+    flood_clear_event('tfa_bypass');
+    return TRUE;
+  }
+
+  // Token was invalid.
+  drupal_set_message(t('You have tried to use an invalid one-time link. Please request a new one.'), 'error');
+  return FALSE;
+}
+
+/**
+ * Logs in an account.
+ *
+ * @param $account
+ */
+function tfa_bypass_login($account) {
+  watchdog('tfa', 'User %name used one-time login link at time %timestamp.', array(
+    '%name' => $account->name,
+    '%timestamp' => REQUEST_TIME,
+  ));
+  tfa_login($account);
+  $params = drupal_get_query_parameters();
+  $destination = isset($params['destination']) ? $params['destination'] : '';
+  drupal_goto($destination);
+}
+
+/**
+ * Access control for the login links.
+ *
+ * @param object $account
+ * @param int $timestamp
+ *
+ * @return bool
+ */
+function tfa_bypass_login_access($account, $timestamp) {
+  return variable_get('tfa_latest_login_link', 0) + 30 > $timestamp;
 }
 
 /**
@@ -158,6 +285,8 @@ function tfa_get_process($account) {
     if (empty($context)) {
       $context = tfa_start_context($account);
     }
+
+
     // Get plugins.
     $fallback_plugins = $login_plugins = array();
     $validate_plugin = $context['plugins']['validate'];
@@ -319,10 +448,17 @@ function tfa_login_submit($form, &$form_state) {
  * @return bool
  */
 function tfa_login_allowed($account) {
+
   // TFA master login allowed switch is set by tfa_login().
   if (isset($_SESSION['tfa'][$account->uid]['login']) && $_SESSION['tfa'][$account->uid]['login'] === TRUE) {
     return TRUE;
   }
+
+  // Don't require TFA unless the account has a role that requires it.
+  if (!tfa_basic_tfa_required($account)) {
+    return TRUE;
+  }
+
   // Else check if login plugins will specifically allow login.
   $tfa = tfa_get_process($account);
   return $tfa->loginAllowed() === TRUE;

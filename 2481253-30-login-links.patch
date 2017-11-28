@@ -1,0 +1,363 @@
+diff --git a/tests/tfa.test b/tests/tfa.test
+index 1366d12..6c073b5 100644
+--- a/tests/tfa.test
++++ b/tests/tfa.test
+@@ -356,6 +356,70 @@ class TfaTestCase extends DrupalWebTestCase {
+     $this->assertIdentical($plain_text, $tfa_totp->readFromStore());
+   }
+ 
++  public function testLoginLinks() {
++    variable_set('tfa_enabled', TRUE);
++
++    $user = $this->web_user;
++
++    // Create a login link.
++    $link = tfa_onetime_link($user, 'login', array('absolute' => TRUE));
++    // Set the last link creation to 3 days before.
++    variable_set('tfa_latest_login_link', REQUEST_TIME - 3*3600*24);
++
++    // Can't log in with it.
++    $this->drupalGet($link);
++    $this->assertText('Access denied', 'Could not log in.');
++
++    // Set the last link creation to current timestamp.
++    variable_set('tfa_latest_login_link', REQUEST_TIME);
++
++    // Access the link again and successfully log in.
++    $this->drupalGet($link);
++    $this->assertNoText('Access denied', 'Successfully logged in.');
++
++    // Confirm it's the same user.
++    $this->drupalGet('user');
++    $this->assertText($user->name, 'Logged in correctly.');
++
++    // Log out.
++    $this->drupalGet('user/logout');
++
++    // Try to log in again with the same link.
++    $this->drupalGet($link);
++    $this->assertText('Access denied', 'Could not log in twice.');
++
++    // Log out.
++    $this->drupalGet('user/logout');
++
++    // Refresh $user.
++    $user = user_load($user->uid);
++
++    // Create a login link with an invalid token.
++    $token = drupal_hash_base64('random_seed');
++    $url = 'system/tfa_bypass/login/' . REQUEST_TIME . '/' . $user->uid . '/' . $token;
++    $link = url($url, array('absolute' => TRUE));
++
++    // Try to log in using the invalid link.
++    $this->drupalGet($link);
++    $this->assertText($this->uiStrings('invalid-link'), 'Could not log in using invalid link.');
++
++    // Create a valid, but expired link.
++    $expire_after = variable_get('tfa_bypass_link_expiration', 3600 * 24);
++    $timestamp = REQUEST_TIME - $expire_after - 30;
++    $token = tfa_onetime_token($user, 'login', $timestamp);
++    $url = 'system/tfa_bypass/login/' . $timestamp . '/' . $user->uid . '/' . $token;
++    $link = url($url, array('absolute' => TRUE));
++
++    // Try to log in using the expired link.
++    $this->drupalGet($link);
++    $this->assertText($this->uiStrings('expired-link'), 'Could not log in using expired link.');
++
++    // Already failed to log in 3 times. Set the flood threshold to 4 and try again.
++    variable_set('tfa_bypass_threshold', 4);
++    $this->drupalGet($link);
++    $this->assertText($this->uiStrings('flood-bypass'), 'Could not log in due to flooding.');
++  }
++
+   /**
+    * TFA module user interface strings.
+    *
+@@ -370,6 +434,12 @@ class TfaTestCase extends DrupalWebTestCase {
+         return 'You have reached the threshold for incorrect code entry attempts.';
+       case 'flood-begin':
+         return 'You have reached the threshold for TFA attempts.';
++      case 'invalid-link':
++        return 'You have tried to use an invalid one-time link. Please request a new one.';
++      case 'expired-link':
++        return 'You have tried to use an expired one-time link. Please request a new one.';
++      case 'flood-bypass':
++        return 'You have reached the threshold for invalid one-time link access attempts.';
+     }
+   }
+ }
+diff --git a/tfa.drush.inc b/tfa.drush.inc
+new file mode 100644
+index 0000000..5f984a2
+--- /dev/null
++++ b/tfa.drush.inc
+@@ -0,0 +1,109 @@
++<?php
++
++/**
++ * @file
++ * Drush integration for TFA.
++ */
++
++/**
++ * Implements hook_drush_command().
++ */
++function tfa_drush_command() {
++  $items['tfa-user-login'] = array(
++    'description' => 'Display a one time login link for the given user account (defaults to uid 1).',
++    'aliases' => array('tuli'),
++    'bootstrap' => DRUSH_BOOTSTRAP_NONE,
++    'handle-remote-commands' => TRUE,
++    'arguments' => array(
++      'user' => 'An optional uid, user name, or email address for the user to log in as. Default is to log in as uid 1. The uid/name/mail options take priority if specified.',
++      'path' => 'Optional path to redirect to after logging in.',
++    ),
++    'options' => array(
++      'browser' => 'Optional value denotes which browser to use (defaults to operating system default). Set to 0 to suppress opening a browser.',
++      'uid' => 'A uid to log in as.',
++      'redirect-port' => 'A custom port for redirecting to (e.g. when running within a Vagrant environment)',
++      'name' => 'A user name to log in as.',
++      'mail' => 'A user mail address to log in as.',
++    ),
++    'examples' => array(
++      'drush tfa-user-login ryan node/add/blog' => 'Displays and opens default web browser (if configured or detected) for a one-time login link for the user with the username ryan and redirect to the path node/add/blog.',
++      'drush tfa-user-login --browser=firefox --mail=drush@example.org admin/settings/performance' => 'Open firefox web browser, login as the user with the e-mail address drush@example.org and redirect to the path admin/settings/performance.',
++    ),
++  );
++  return $items;
++}
++
++/**
++ * Displays a one time login link for the given user.
++ */
++function drush_tfa_user_login($user = '', $path = NULL) {
++  $args = func_get_args();
++
++  // Redispatch if called against a remote-host so a browser is started on the
++  // the *local* machine.
++  $alias = drush_get_context('DRUSH_TARGET_SITE_ALIAS');
++  if (drush_sitealias_is_remote_site($alias)) {
++    $return = drush_invoke_process($alias, 'tfa-user-login', $args, drush_redispatch_get_options(), array('integrate' => FALSE));
++    if ($return['error_status']) {
++      return drush_set_error('Unable to execute user login.');
++    }
++    else {
++      $link = $return['object'];
++    }
++  }
++  else {
++    if (!drush_bootstrap(DRUSH_BOOTSTRAP_DRUPAL_FULL)) {
++      // Fail gracefully if unable to bootstrap Drupal.
++      // drush_bootstrap() has already logged an error.
++      return FALSE;
++    }
++
++    if (drush_get_option('uid', FALSE) || drush_get_option('name', FALSE) || drush_get_option('mail', FALSE)) {
++      // If we only have a single argument and one of the user options is passed,
++      // then we assume the argument is the path to open.
++      if (count($args) == 1) {
++        $path = $args[0];
++      }
++    }
++
++    // Try to load a user from provided options and arguments.
++    if ($uid = drush_get_option('uid', FALSE)) {
++      $account = user_load($uid);
++    }
++    elseif ($name = drush_get_option('name', FALSE)) {
++      $account = user_load_by_name($name);
++    }
++    elseif ($mail = drush_get_option('mail', FALSE)) {
++      $account = user_load_by_mail($mail);
++    }
++    elseif (is_numeric($user) && $account = user_load($user)) {
++    }
++    elseif (($user != "") && ($account = user_load_by_name($user))) {
++    }
++    elseif (($user != "") && ($account = user_load_by_mail($user))) {
++    }
++    elseif ($account = user_load(1)) {
++    }
++    else {
++      return drush_set_error(dt('Could not find the specified user.'));
++    }
++
++    // Construct login link.
++    $options = array('absolute' => TRUE);
++    if ($path) {
++      $options['destination'] = $path;
++    }
++    $link = tfa_onetime_link($account, 'login', $options);
++    variable_set('tfa_latest_login_link', REQUEST_TIME);
++  }
++  $port = drush_get_option('redirect-port', FALSE);
++  drush_start_browser($link, FALSE, $port);
++  return $link;
++}
++
++/**
++ * Informs the user about TFA's presence when the uli command is used.
++ */
++function drush_tfa_post_user_login() {
++  drush_log(dt("Two-factor Authentication (TFA) is enabled. To skip the TFA process use the 'drush tfa-user-login' ('drush tuli') command instead."), 'warning');
++}
+diff --git a/tfa.install b/tfa.install
+index cbf7943..2db6d57 100644
+--- a/tfa.install
++++ b/tfa.install
+@@ -19,6 +19,10 @@ function tfa_uninstall() {
+   variable_del('tfa_required');
+   variable_del('tfa_enabled');
+   variable_del('tfa_test_mode');
++  variable_del('tfa_bypass_link_expiration');
++  variable_del('tfa_latest_login_link');
++  variable_del('tfa_bypass_threshold');
++  variable_del('tfa_bypass_window');
+ }
+ 
+ /**
+diff --git a/tfa.module b/tfa.module
+index a4160ec..bc3412d 100644
+--- a/tfa.module
++++ b/tfa.module
+@@ -26,6 +26,15 @@ function tfa_menu() {
+     'access arguments' => array('admin tfa settings'),
+     'file' => 'tfa.admin.inc',
+   );
++
++  $items['system/tfa_bypass/login/%/%user/%'] = array(
++    'title' => 'TFA login link',
++    'page callback' => 'tfa_bypass_login',
++    'page arguments' => array(4),
++    'access callback' => 'tfa_bypass_access',
++    'access arguments' => array(2, 3, 4, 5, 'tfa_bypass_login_access'),
++    'type' => MENU_CALLBACK,
++  );
+   return $items;
+ }
+ 
+@@ -53,6 +62,124 @@ function tfa_permission() {
+ }
+ 
+ /**
++ * Creates a one-time token for a user account.
++ *
++ * This token is valid until the user logs in, and is unique to the site.
++ *
++ * @param object $account
++ * @param string $type
++ * @param int $timestamp
++ *
++ * @return string
++ */
++function tfa_onetime_token($account, $type, $timestamp) {
++  $data = implode(':', array(
++    drupal_get_hash_salt(),
++    $timestamp,
++    $account->name,
++    $account->pass,
++    $account->login,
++    $type,
++  ));
++  return drupal_hash_base64($data);
++}
++
++/**
++ * Creates a one-time link for a user account.
++ *
++ * @param object $account
++ * @param string $type
++ * @param array $options
++ *
++ * @return string
++ *
++ * @see tfa_onetime_token()
++ */
++function tfa_onetime_link($account, $type, array $options) {
++  $timestamp = REQUEST_TIME;
++  $token = tfa_onetime_token($account, $type, $timestamp);
++  $url = 'system/tfa_bypass/' . $type . '/' . $timestamp . '/' . $account->uid . '/' . $token;
++  return url($url, $options);
++}
++
++/**
++ * Common access control for bypass links.
++ *
++ * @param string $type
++ * @param int $timestamp
++ * @param object $account
++ * @param string $token
++ * @param callable $custom_access
++ *
++ * @return bool
++ */
++function tfa_bypass_access($type, $timestamp, $account, $token, $custom_access = NULL) {
++  // Flood control.
++  if (!variable_get('tfa_test_mode', 0)) {
++    $window = variable_get('tfa_bypass_window', 3600);
++    flood_register_event('tfa_bypass', $window);
++    if (!flood_is_allowed('tfa_bypass', variable_get('tfa_bypass_threshold', 6), $window)) {
++      drupal_set_message(t('You have reached the threshold for invalid one-time link access attempts. Please request a new link and try again in !time minutes.', array('!time' => round($window / 60))), 'error');
++      return FALSE;
++    }
++  }
++
++  // Access control.
++  if (tfa_onetime_token($account, $type, $timestamp) == $token) {
++    $expire_after = variable_get('tfa_bypass_link_expiration', 3600 * 24);
++    if (REQUEST_TIME - $timestamp > $expire_after) {
++      // Link was expired.
++      drupal_set_message(t('You have tried to use an expired one-time link. Please request a new one.'), 'error');
++      return FALSE;
++    }
++    if ($custom_access != NULL) {
++      // Invoke custom access control function.
++      if (call_user_func_array($custom_access, array($account, $timestamp))) {
++        flood_clear_event('tfa_bypass');
++        return TRUE;
++      }
++      else {
++        return FALSE;
++      }
++    }
++    flood_clear_event('tfa_bypass');
++    return TRUE;
++  }
++
++  // Token was invalid.
++  drupal_set_message(t('You have tried to use an invalid one-time link. Please request a new one.'), 'error');
++  return FALSE;
++}
++
++/**
++ * Logs in an account.
++ *
++ * @param $account
++ */
++function tfa_bypass_login($account) {
++  watchdog('tfa', 'User %name used one-time login link at time %timestamp.', array(
++    '%name' => $account->name,
++    '%timestamp' => REQUEST_TIME,
++  ));
++  tfa_login($account);
++  $params = drupal_get_query_parameters();
++  $destination = isset($params['destination']) ? $params['destination'] : '';
++  drupal_goto($destination);
++}
++
++/**
++ * Access control for the login links.
++ *
++ * @param object $account
++ * @param int $timestamp
++ *
++ * @return bool
++ */
++function tfa_bypass_login_access($account, $timestamp) {
++  return variable_get('tfa_latest_login_link', 0) + 30 > $timestamp;
++}
++
++/**
+  * Set context for account's TFA process.
+  *
+  * @param object $account
