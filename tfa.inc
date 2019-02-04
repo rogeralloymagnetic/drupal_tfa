@@ -376,6 +376,8 @@ class TfaSetup {
  */
 abstract class TfaBasePlugin {
 
+  const CRYPT_VERSION = '1';
+
   /**
    * @var string
    */
@@ -502,12 +504,39 @@ abstract class TfaBasePlugin {
    *
    * Should be used when writing codes to storage.
    *
-   * @param string.
+   * @param string $text
+   *   The plaintext to be encrypted.
+   *
    * @return string
+   *   The encrypted text.
    */
   protected function encrypt($text) {
+    // Backwards compatibility with MCrypt.
+    if (!extension_loaded('openssl') && extension_loaded('mcrypt')) {
+      return $this->encryptWithMCrypt($text);
+    }
+    $iv = drupal_random_bytes(16);
+    // Using 1 instead of the constant OPENSSL_RAW_DATA, for PHP 5.3.
+    $ciphertext = openssl_encrypt($text, 'AES-256-CBC', $this->encryptionKey, 1, $iv);
+    $crypto_data = array(
+      'version' => self::CRYPT_VERSION,
+      'iv_base64' => base64_encode($iv),
+      'ciphertext_base64' => base64_encode($ciphertext),
+    );
+    $json_encoded_crypto_data = drupal_json_encode($crypto_data);
+    return $json_encoded_crypto_data;
+  }
+
+  /**
+   * Encrypt using the deprecated mcrypt extension.
+   *
+   * @param string $text
+   *
+   * @return string
+   */
+  protected function encryptWithMCrypt($text, $iv = null) {
     $td = mcrypt_module_open('rijndael-128', '', 'cbc', '');
-    $iv = drupal_random_bytes(mcrypt_enc_get_iv_size($td));
+    $iv = $iv ?: drupal_random_bytes(mcrypt_enc_get_iv_size($td));
 
     $key = substr($this->encryptionKey, 0, mcrypt_enc_get_key_size($td));
 
@@ -528,10 +557,42 @@ abstract class TfaBasePlugin {
    *
    * Should be used when reading codes from storage.
    *
-   * @param string
-   * @return string
+   * @param string $data
+   *   The encrypted text.
+   *
+   * @return string|boolean
+   *   The plaintext, or FALSE on failure.
    */
   protected function decrypt($data) {
+    $is_legacy = TRUE;
+    $crypto_data = drupal_json_decode($data);
+    if (!empty($crypto_data['version']) && !empty($crypto_data['iv_base64']) && !empty($crypto_data['ciphertext_base64'])) {
+      $is_legacy = FALSE;
+    }
+    // Backwards compatibility with the old MCrypt scheme.
+    if ($is_legacy === TRUE) {
+      if (extension_loaded('openssl')) {
+        return $this->decryptLegacyDataWithOpenSSL($data);
+      }
+      if (extension_loaded('mcrypt')) {
+        return $this->decryptLegacyDataWithMCrypt($data);
+      }
+      return FALSE;
+    }
+    $iv = base64_decode($crypto_data['iv_base64']);
+    $ciphertext = base64_decode($crypto_data['ciphertext_base64']);
+    return openssl_decrypt($ciphertext, 'AES-256-CBC', $this->encryptionKey, TRUE, $iv);
+  }
+
+  /**
+   * Decrypt using the deprecated MCrypt extension.
+   *
+   * @param string $data
+   *
+   * @return string|boolean
+   *   The plaintext, or FALSE on failure.
+   */
+  protected function decryptLegacyDataWithMCrypt($data) {
     $td = mcrypt_module_open('rijndael-128', '', 'cbc', '');
     $iv = substr($data, 0, mcrypt_enc_get_iv_size($td));
 
@@ -551,6 +612,65 @@ abstract class TfaBasePlugin {
     return $text;
   }
 
+  /**
+   * Use OpenSSL to decrypt data that was originally encrypted with MCrypt
+   * (by an earlier version of this module).
+   *
+   * @param string $data
+   *
+   * @return string|boolean
+   *   The plaintext, or FALSE on failure.
+   */
+  protected function decryptLegacyDataWithOpenSSL($data) {
+    $key_size = 32; // Based on return value of mcrypt_enc_get_key_size($td).
+    $iv_size = 16; // Based on return value of mcrypt_enc_get_iv_size($td).
+    $key = substr($this->encryptionKey, 0, $key_size);
+    $iv = substr($data, 0, $iv_size);
+    // Using 3 instead of the constant OPENSSL_NO_PADDING, for PHP 5.3.
+    $options = 3;
+    $decrypted_data = openssl_decrypt($data, 'AES-256-CBC', $key, $options, $iv);
+
+    // Look for the message length component of the string.
+    $regex = '/[\d]+\|/';
+    preg_match_all($regex, $decrypted_data, $msg_len_matches);
+    if (empty($msg_len_matches[0])) {
+      return FALSE;
+    }
+    // There is usually null padding at the end of $decrypted_data. Since it is
+    // possible that the original string (pre-encryption) had one ore more nulls
+    // at the end, determine the maxumum number of characters that can be
+    // truncated from the end. We may end up truncating less than the maximum.
+    $possible_null_padding_length = 0;
+    $null_right_padding_regex = '/[\0]+/';
+    preg_match_all($null_right_padding_regex, $decrypted_data, $null_padding_matches);
+    if (!empty($null_padding_matches[0][0])) {
+      $possible_null_padding_length = strlen($null_padding_matches[0][0]);
+    }
+
+    // Outer loop: Find possible message length strings.
+    $start_text_offset = 0;
+    foreach ($msg_len_matches[0] as $i => $match_string) {
+      $match_string_length = strlen($match_string);
+      $pos = strpos($decrypted_data, $match_string, $start_text_offset);
+      $start_text_offset = $pos + $match_string_length;
+      $remaining_string = substr($decrypted_data, $pos + $match_string_length);
+      $possible_message_length = substr($match_string, 0, -1);
+      // Inner loop: Since random data is to the left of the message length string
+      // we want, verify the message length matches what the string says it should
+      // be. It is possible (although unlikely) that there is one or more digits
+      // in front of the length string - this code handles this use case.
+      while (strlen($possible_message_length) > 0) {
+        $test_length = strlen($remaining_string);
+        // Since it is possible for the original string (before encryption) to end
+        // with null bytes, take $possible_null_padding_length into consideration.
+        if (($possible_message_length <= $test_length) && ($possible_message_length >= ($test_length - $possible_null_padding_length))) {
+          return substr($decrypted_data, $start_text_offset, $possible_message_length);
+        }
+        $possible_message_length = substr($possible_message_length, 1);
+      }
+    }
+    return FALSE;
+  }
 }
 
 /**
